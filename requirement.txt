@@ -1,0 +1,8 @@
+langchain
+langchain_community
+langchain_core
+langchain_classic
+langchain_groq
+chromadb
+langgraph-checkpoint-sqlite
+streamlit
