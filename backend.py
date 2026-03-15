@@ -139,8 +139,11 @@ def generate(state:GraphState)->dict:
     ])
 
     history_str = ""
-    if history_list:
-        history_str = "\n".join([f"Previous AI Response: {msg.content}" for msg in history_list])
+    for msg in history_list:
+        if getattr(msg, 'type', '') == 'ai':
+            history_str += f"GitaBot: {msg.content}\n"
+        elif getattr(msg, 'type', '') == 'human':
+            history_str += f"User: {msg.content}\n"
 
     prompt = ChatPromptTemplate.from_messages(
         [
