@@ -3,11 +3,13 @@ from typing import TypedDict, List, Annotated
 from langchain.messages import AnyMessage,AIMessage
 from langgraph.graph.message import add_messages
 from langchain_core.documents import Document
+import operator
 
 class GraphState(TypedDict):
     question: str
+    sub_queries : List[str]
     generation : Annotated[List[AnyMessage],add_messages ]
-    documents: List[Document]
+    documents: Annotated[List[Document], operator.add]  #document result must overwrite not replace
 
 # %%
 #create a model
@@ -16,14 +18,12 @@ from dotenv import load_dotenv
 load_dotenv()
 from langchain_groq import ChatGroq
 grader_model = ChatGroq(
-    # model="llama-3.3-70b-versatile",
-    model = "llama-3.1-8b-instant",
+    model="llama-3.3-70b-versatile",
     api_key=os.getenv("GROQ_API_KEY"),
     temperature=0
 )
 
 from langchain_community.chat_models import ChatOllama
-
 from langchain_community.embeddings import OllamaEmbeddings
 embeddings = OllamaEmbeddings(model = "nomic-embed-text")
 
@@ -40,21 +40,22 @@ database_collection = chroma_client.get_collection('bhagavad-gita')
 
 # %%
 def retrieve(state:GraphState)->dict:
-    question = state['question']
-    question_vector = embeddings.embed_query(question)
-    response = database_collection.query(query_embeddings=[question_vector], n_results=2)
+    current_query = state['question']
+    print(f"---RETRIEVING FOR: {current_query}---")
+    question_vector = embeddings.embed_query(current_query)
+    response = database_collection.query(query_embeddings=[question_vector],n_results=1)
 
     ans = []
 
-    #[0] bcz we want first document as we are passing only 1 query at a time
-    docs = response['documents'][0]
-    metas = response['metadatas'][0]
+    if response['documents'] and response['documents'][0]:  #DOUBT
+        docs = response['documents'][0]  #[0] bcz we want first document as we are passing only 1 query at a time
+        metas = response['metadatas'][0]
 
-    for i,j in zip(docs, metas):
-        a = Document(page_content=i, metadata=j) 
-        ans.append(a)
+        for i,j in zip(docs, metas):
+            a = Document(page_content=i, metadata=j) 
+            ans.append(a)
 
-    return {"documents":ans}
+    return {"documents":ans}    #bcz of operator.add langgraph will append them automatically
 
 
 # %%
@@ -97,6 +98,34 @@ def grade_documents(state:GraphState):
     return {"documents": filtered_docs}
 
 # %%
+#decomposing the query
+
+class QueryBreakdown(BaseModel):
+    """List of individual search queries extracted from a complex user prompt."""
+    
+    queries: List[str] = Field(description="A list of distinct, search-optimized queries. Strip out conversational filler (like 'Hello' or 'My name is'). If the user asks multiple things, split them into separate strings.")
+
+def decompose_query(state:GraphState):
+    print("---DECOMPOSING COMPLEX QUERY---")
+    question = state['question']
+
+    structured_llm = grader_model.with_structured_output(QueryBreakdown)
+
+    system = """You are a master query analyzer. The user will give you a messy, multi-part prompt. 
+        Your job is to break it down into a list of standalone, highly-specific search queries optimized for a vector database.
+        Ignore conversational filler. Focus only on the core intents."""
+
+    p = ChatPromptTemplate.from_messages([
+            ('system',system),
+            ('human','User Prompt : {question}')
+        ])
+
+    chain = p | structured_llm
+    result = chain.invoke({"question":question})
+
+    return {"sub_queries":result.queries}
+
+# %%
 #generate response
 def generate(state:GraphState)->dict:
     question = state['question']
@@ -110,27 +139,24 @@ def generate(state:GraphState)->dict:
     ])
 
     history_str = ""
-    for msg in history_list:
-        if msg.type =='ai':
-            history_str+=f'GitaBot: {msg.content}\n'
-        elif msg.type == 'human':
-            history_str += f'User: {msg.content}\n'
+    if history_list:
+        history_str = "\n".join([f"Previous AI Response: {msg.content}" for msg in history_list])
 
     prompt = ChatPromptTemplate.from_messages(
         [
             ('system', """You are a spiritual assistant drawing wisdom from the Bhagavad Gita. 
+            Use the retrieved context to answer the user's question. 
+            If the user asks about something discussed previously in the chat, use the Conversation History to answer them.
             
-            Retrieved Context:
-            {context}
+            CRITICAL INSTRUCTION: If the answer is not contained strictly within the retrieved context or conversation history, you must say 'I do not know'. Do not use outside knowledge. Do not attempt to correct or debate the provided text.
+
+            "CRITICAL TONE RESTRICTION: Do not use modern self-help terminology, therapy-speak, or modern productivity advice (e.g., 'take breaks', 'designate a workspace'). Speak solemnly, using ancient, philosophical, and traditional Vedic language."
             
             Conversation History:
             {history}
             
-            INSTRUCTIONS:
-            1. Use the Retrieved Context to answer the user's question.
-            2. If the user asks a follow-up question (e.g., "explain that simpler", "summarize that"), look at the Conversation History and modify your previous answer.
-            3. Do not use modern self-help terminology. Speak solemnly.
-            4. If the answer cannot be found in the Context or History, politely say: "I do not have the spiritual context to answer that." Do not repeat this rule back to the user."""),
+            Retrieved Context:
+            {context}"""),
             ('human', "{question}")
         ]
     )
@@ -180,6 +206,22 @@ def check_scope(state: GraphState) -> str:
 # from langgraph.checkpoint.memory import MemorySaver
 # as it will erase memory everytime the server restart
 
+# %% [markdown]
+# Instead of moving sequentially from one node to the next, we are going to tell LangGraph to spawn a separate, parallel thread for every single query in that list, execute them all simultaneously against ChromaDB, and then collapse the results back into a single list of documents.
+
+# %%
+from langgraph.constants import Send
+
+def route_to_parallel_retrieval(state:GraphState):
+    print('---FANNING OUT QUERIES TO PARALLEL THREADS---')
+    sub_queries = state.get('sub_queries',[])
+
+    # if the decomposer failed and returned nothing fall back to original question
+    if not sub_queries:
+        return [Send("retrieve",{"question" : state['question']})]
+    
+    return [Send('retrieve',{'question':q}) for q in sub_queries]
+
 # %%
 #setting database 
 import sqlite3
@@ -199,8 +241,11 @@ workflow.add_node("retrieve",retrieve)
 workflow.add_node('grade_documents',grade_documents)
 workflow.add_node('generate',generate)
 workflow.add_node('rewrite_query',rewrite_query)
+workflow.add_node('decompose_query',decompose_query)
 
-workflow.add_edge(START,"retrieve")
+workflow.add_edge(START,"decompose_query")
+workflow.add_conditional_edges("decompose_query",route_to_parallel_retrieval,['retrieve'])
+
 workflow.add_edge("retrieve","grade_documents")
 workflow.add_conditional_edges("grade_documents", decide_to_generate,{"generate":"generate", "rewrite":'rewrite_query'})
 workflow.add_edge("generate",END)
@@ -212,9 +257,5 @@ workflow.add_conditional_edges(
         "generate": "generate"
     }
 )
-# workflow.add_edge('rewrite_query','retrieve')
 
 app = workflow.compile(checkpointer=memory)
-
-
-
