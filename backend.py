@@ -1,6 +1,6 @@
 # %%
 from typing import TypedDict, List, Annotated
-from langchain.messages import AnyMessage,AIMessage
+from langchain.messages import AnyMessage,AIMessage,HumanMessage
 from langgraph.graph.message import add_messages
 from langchain_core.documents import Document
 import operator
@@ -10,6 +10,7 @@ class GraphState(TypedDict):
     sub_queries : List[str]
     generation : Annotated[List[AnyMessage],add_messages ]
     documents: Annotated[List[Document], operator.add]  #document result must overwrite not replace
+    filtered_documents : List[Document]
 
 # %%
 #create a model
@@ -18,7 +19,8 @@ from dotenv import load_dotenv
 load_dotenv()
 from langchain_groq import ChatGroq
 grader_model = ChatGroq(
-    model="llama-3.3-70b-versatile",
+    # model="llama-3.3-70b-versatile",
+    model="llama-3.1-8b-instant",
     api_key=os.getenv("GROQ_API_KEY"),
     temperature=0
 )
@@ -95,7 +97,7 @@ def grade_documents(state:GraphState):
         if score.binary_score == 'yes':
             filtered_docs.append(i)
 
-    return {"documents": filtered_docs}
+    return {"filtered_documents": filtered_docs}
 
 # %%
 #decomposing the query
@@ -129,7 +131,7 @@ def decompose_query(state:GraphState):
 #generate response
 def generate(state:GraphState)->dict:
     question = state['question']
-    documents = state['documents']
+    documents = state.get('filtered_documents', [])
 
     # 1. Safely extract the past conversation history from the state
     history_list = state.get('generation', [])
@@ -139,10 +141,10 @@ def generate(state:GraphState)->dict:
     ])
 
     history_str = ""
-    for msg in history_list:
-        if getattr(msg, 'type', '') == 'ai':
+    for msg in history_list[-6:]:
+        if isinstance(msg, AIMessage):
             history_str += f"GitaBot: {msg.content}\n"
-        elif getattr(msg, 'type', '') == 'human':
+        elif isinstance(msg, HumanMessage):
             history_str += f"User: {msg.content}\n"
 
     prompt = ChatPromptTemplate.from_messages(
@@ -171,7 +173,7 @@ def generate(state:GraphState)->dict:
 # %%
 def decide_to_generate(state:GraphState) ->str:
     print("---ASSESS GRADED DOCUMENTS---")
-    if not state['documents']:
+    if not state['filtered_documents']:
         print('---DECISION: ALL DOCUMENTS ARE NOT RELEVANT. ENDING---')
         return "rewrite"
     print('---DECISION: GENERATE')
@@ -198,7 +200,7 @@ def rewrite_query(state:GraphState)->dict:
 # %%
 def check_scope(state: GraphState) -> str:
     print("---CHECKING REWRITTEN QUERY SCOPE---")
-    if state['question'] == "OUT_OF_SCOPE":
+    if "OUT_OF_SCOPE" in state['question']:
         print("---DECISION: OUT OF SCOPE. ROUTING TO GENERATE---")
         return "generate"
     print("---DECISION: QUERY REWRITTEN. ROUTING TO RETRIEVE---")
