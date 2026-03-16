@@ -26,8 +26,8 @@ grader_model = ChatGroq(
 )
 
 from langchain_community.chat_models import ChatOllama
-from langchain_community.embeddings import OllamaEmbeddings
-embeddings = OllamaEmbeddings(model = "nomic-embed-text")
+from langchain_huggingface import HuggingFaceEmbeddings
+embeddings = HuggingFaceEmbeddings(model_name="BAAI/bge-small-en-v1.5")
 
 generator_model = ChatOllama(
     model = 'gitabot',
